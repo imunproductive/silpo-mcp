@@ -8,6 +8,8 @@
 
 export const ECOM_BASE = "https://sf-ecom-api.silpo.ua";
 export const EXTERNAL_BASE = "https://sf-external-api.silpo.ua";
+/** Account/ecom API — used for order history that includes line items. */
+export const ORDERS_BASE = "https://ecom-api.silpo.ua";
 /** CDN that serves product artwork (the bare filenames in a product's `media`). */
 export const IMAGES_BASE = "https://images.silpo.ua";
 

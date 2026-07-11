@@ -19,6 +19,7 @@ import {
   ALL_DELIVERY_TYPES,
   ECOM_BASE,
   EXTERNAL_BASE,
+  ORDERS_BASE,
   fetchImageAsBase64,
   productImageUrl,
   silpoRequest,
@@ -1368,6 +1369,72 @@ server.tool(
           )
           .join("\n"),
       );
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "get_order_products",
+  "Товари (позиції) з конкретного замовлення. За номером замовлення, або — " +
+    "якщо не вказано — з останнього. Потрібна авторизація.",
+  {
+    orderNumber: z
+      .string()
+      .optional()
+      .describe("Номер замовлення, напр. '35703530' (порожньо — останнє замовлення)"),
+    searchLimit: z
+      .number()
+      .int()
+      .min(1)
+      .max(50)
+      .default(15)
+      .describe("Скільки останніх замовлень переглянути в пошуках номера"),
+  },
+  async ({ orderNumber, searchLimit }) => {
+    try {
+      // The v3 store-front orders list already embeds each order's line items
+      // under shipments[].items[], so no per-order fetch is needed.
+      const data = await withAuthRetry((token) =>
+        silpoRequest<any>("/v3/store-front/orders", {
+          base: ORDERS_BASE,
+          query: { limit: searchLimit, offset: 0, "filter[business]": ["silpo"] },
+          token,
+        }),
+      );
+      const orders: any[] = data.items ?? [];
+      if (!orders.length) return text("Історія замовлень порожня.");
+      const order = orderNumber
+        ? orders.find((o) => String(o.number) === orderNumber)
+        : orders[0];
+      if (!order) {
+        return text(
+          `Замовлення №${orderNumber} не знайдено серед останніх ${orders.length}. ` +
+            "Збільште searchLimit або перевірте номер.",
+        );
+      }
+
+      const items: any[] = (order.shipments ?? []).flatMap((s: any) => s.items ?? []);
+      const lines = items.map((i) => {
+        const p = i.product ?? {};
+        const flags = [
+          i.removed ? "видалено" : null,
+          i.added ? "додано" : null,
+          i.replacements?.length ? "заміна" : null,
+        ].filter(Boolean);
+        return (
+          `• ${p.title ?? "?"} ×${i.quantity} — ${i.subtotal}₴` +
+          (flags.length ? ` (${flags.join(", ")})` : "") +
+          (i.comment ? ` — «${i.comment}»` : "") +
+          (p.id ? `\n  productId: ${p.id}` : "")
+        );
+      });
+      const header =
+        `Замовлення №${order.number} — ${order.status}, ${order.amount}₴ ` +
+        `(${items.length} позицій)\n` +
+        `дата: ${order.delivery?.timeSlot?.from ?? order.createdAt ?? "?"}`;
+      return text(`${header}\n${lines.join("\n")}`);
     } catch (e) {
       return fail(e);
     }
