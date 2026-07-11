@@ -5,7 +5,7 @@
  * Exposes the Silpo (Сільпо) online-supermarket storefront API as MCP tools:
  * delivery-address/zone resolution, product search, categories, promotions,
  * product details, delivery time slots, the Silpo cart, a shopping list,
- * recipes and (with a cabinet token) order history and loyalty balance.
+ * recipes and (with a cabinet token/cookie) order history and loyalty balance.
  */
 
 import { randomUUID } from "node:crypto";
@@ -30,10 +30,15 @@ import {
 } from "./silpo-api.js";
 import {
   requireBranch,
-  requireToken,
   session,
   type ShoppingListItem,
 } from "./session.js";
+import {
+  AuthRefreshError,
+  normalizeAuthCookie,
+  refreshCabinetToken,
+  secondsUntilExpiry,
+} from "./silpo-auth.js";
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -55,6 +60,65 @@ function fail(err: unknown) {
         ? err.message
         : String(err);
   return { content: [{ type: "text" as const, text: `❌ ${msg}` }], isError: true };
+}
+
+/**
+ * Refresh `session.authToken` in place when it is missing or within `skewSec`
+ * of expiry and a refresh cookie is available. Also persists any rotated
+ * session cookie the server hands back, keeping the stored cookie current.
+ * Pass `skewSec = Infinity` to force a refresh regardless of the current token.
+ */
+async function refreshAuthIfStale(skewSec = 120): Promise<void> {
+  const left = session.authToken ? secondsUntilExpiry(session.authToken) : null;
+  const stale = !session.authToken || left === null || left <= skewSec;
+  if (stale && session.authCookie) {
+    const res = await refreshCabinetToken(session.authCookie);
+    session.authToken = res.accessToken;
+    if (res.authCookie) session.authCookie = res.authCookie;
+  }
+}
+
+/**
+ * Global cabinet-token accessor. Returns a token that is valid for at least the
+ * next `skewSec` seconds, transparently refreshing via the stored session
+ * cookie when needed. Throws when no token or cookie is available. Use this
+ * everywhere a required token is needed.
+ */
+async function getToken(skewSec = 120): Promise<string> {
+  await refreshAuthIfStale(skewSec);
+  if (!session.authToken) {
+    throw new Error(
+      "This action needs authorization. Call set_auth_cookie (recommended — " +
+        "auto-refreshes) or set_auth_token with a Bearer token from id.silpo.ua.",
+    );
+  }
+  return session.authToken;
+}
+
+/**
+ * Optional variant for endpoints where auth is not required (the cart works
+ * anonymously): returns a fresh token if we hold credentials, else undefined.
+ */
+async function getTokenOptional(skewSec = 120): Promise<string | undefined> {
+  await refreshAuthIfStale(skewSec);
+  return session.authToken;
+}
+
+/**
+ * Run an authenticated call; if it 401s and we hold a refresh cookie, force a
+ * token refresh once and retry. `run` receives the current token.
+ */
+async function withAuthRetry<T>(run: (token: string) => Promise<T>): Promise<T> {
+  const token = await getToken();
+  try {
+    return await run(token);
+  } catch (e) {
+    if (e instanceof SilpoApiError && e.status === 401 && session.authCookie) {
+      await refreshAuthIfStale(Infinity);
+      if (session.authToken) return run(session.authToken);
+    }
+    throw e;
+  }
 }
 
 function formatProduct(p: ProductListItem): string {
@@ -271,8 +335,44 @@ server.tool(
     "кошик, історія замовлень, баланс бонусів.",
   { token: z.string().describe("Токен доступу (з або без префікса 'Bearer ')") },
   async ({ token }) => {
-    session.authToken = token;
-    return text("✅ Токен авторизації збережено для цієї сесії.");
+    session.authToken = token.trim().replace(/^bearer\s+/i, "");
+    const left = secondsUntilExpiry(session.authToken);
+    const note =
+      left === null
+        ? ""
+        : left <= 0
+          ? " ⚠️ Токен уже прострочений."
+          : ` Дійсний ще ~${Math.round(left / 3600)} год.`;
+    return text(
+      `✅ Токен авторизації збережено для цієї сесії.${note}\n` +
+        "Порада: set_auth_cookie автоматично оновлюватиме токен без ручного вводу.",
+    );
+  },
+);
+
+server.tool(
+  "set_auth_cookie",
+  "Зберегти cookie сесії Сільпо (.AspNetCore.Identity.Application) для " +
+    "автоматичного оновлення токена кабінету. Візьміть його в DevTools → " +
+    "Application → Cookies для auth.silpo.ua. Можна вставити саме значення, " +
+    "пару name=value або повний рядок cookie.",
+  { cookie: z.string().describe("Значення cookie .AspNetCore.Identity.Application") },
+  async ({ cookie }) => {
+    try {
+      const normalized = normalizeAuthCookie(cookie);
+      const res = await refreshCabinetToken(normalized);
+      session.authCookie = res.authCookie ?? normalized;
+      session.authToken = res.accessToken;
+      const { expiresIn } = res;
+      return text(
+        `✅ Cookie збережено; токен кабінету оновлено (дійсний ~${Math.round(
+          expiresIn / 3600,
+        )} год). Надалі оновлюватиметься автоматично.`,
+      );
+    } catch (e) {
+      if (e instanceof AuthRefreshError) return fail(e);
+      return fail(e);
+    }
   },
 );
 
@@ -286,7 +386,7 @@ server.tool(
     try {
       const cart = await silpoRequest<any>(
         `/v2/uk/shopping-cart/${encodeURIComponent(basketId)}`,
-        { query: { strictValidation: false }, token: session.authToken },
+        { query: { strictValidation: false }, token: await getTokenOptional() },
       );
       if (cart?.address?.latitude && cart?.address?.longitude) {
         session.address = {
@@ -325,6 +425,8 @@ server.tool("get_session_info", "Інформація про поточну се
     deliveryType: session.deliveryType ?? null,
     timeslot: session.timeslot ?? null,
     hasAuthToken: Boolean(session.authToken),
+    authTokenExpiresInSec: session.authToken ? secondsUntilExpiry(session.authToken) : null,
+    hasAuthCookie: Boolean(session.authCookie),
     basketId: session.basketId ?? null,
     shoppingListItems: session.shoppingList.length,
   });
@@ -880,7 +982,7 @@ function summarizeServerCart(cart: any): string {
 async function fetchServerCart(id: string): Promise<any> {
   return silpoRequest<any>(`/v2/uk/shopping-cart/${encodeURIComponent(id)}`, {
     query: { ignoreCache: false, strictValidation: false },
-    token: session.authToken,
+    token: await getTokenOptional(),
   });
 }
 
@@ -915,7 +1017,7 @@ async function createBasket(): Promise<string> {
   const res = await silpoRequest<any>("/v2/shopping-cart", {
     method: "POST",
     body: buildCartPatchBody({ id: randomUUID() }),
-    token: session.authToken,
+    token: await getTokenOptional(),
   });
   if (!res?.id) throw new Error("Сервер не повернув id кошика.");
   session.basketId = res.id;
@@ -972,7 +1074,7 @@ async function setServerCartQuantity(
         },
       ],
     },
-    token: session.authToken,
+    token: await getTokenOptional(),
   });
   return fetchServerCart(id);
 }
@@ -987,7 +1089,7 @@ async function removeServerCartProduct(id: string, productId: string): Promise<a
   await silpoRequest(`/v1/shopping-cart/${encodeURIComponent(id)}/removeProducts`, {
     method: "DELETE",
     body: { products: [{ productId, type: "product" }] },
-    token: session.authToken,
+    token: await getTokenOptional(),
   });
   return fetchServerCart(id);
 }
@@ -1036,7 +1138,7 @@ async function patchServerCart(id: string, overrides: Record<string, unknown> = 
   return silpoRequest<any>(`/v2/shopping-cart/${encodeURIComponent(id)}`, {
     method: "PATCH",
     body: buildCartPatchBody(overrides),
-    token: session.authToken,
+    token: await getTokenOptional(),
   });
 }
 
@@ -1137,7 +1239,7 @@ server.tool("clear_cart", "Видалити всі товари з кошика 
       body: {
         products: products.map((p: any) => ({ productId: p.productId, type: "product" })),
       },
-      token: session.authToken,
+      token: await getTokenOptional(),
     });
     return text(`✅ Кошик очищено (видалено позицій: ${products.length}).`);
   } catch (e) {
@@ -1154,7 +1256,7 @@ server.tool(
       const id = requireBasket();
       await silpoRequest(
         `/v1/shopping-cart/${encodeURIComponent(id)}/products/${encodeURIComponent(productId)}/comment`,
-        { method: "POST", body: { comment }, token: session.authToken },
+        { method: "POST", body: { comment }, token: await getTokenOptional() },
       );
       return text(`✅ Коментар додано.\n${summarizeServerCart(await fetchServerCart(id))}`);
     } catch (e) {
@@ -1247,11 +1349,12 @@ server.tool(
   { limit: z.number().int().min(1).max(50).default(10) },
   async ({ limit }) => {
     try {
-      const token = requireToken();
-      const data = await silpoRequest<any>("/v2/order-history/orders", {
-        query: { limit, "filter[business]": "silpo" },
-        token,
-      });
+      const data = await withAuthRetry((token) =>
+        silpoRequest<any>("/v2/order-history/orders", {
+          query: { limit, "filter[business]": "silpo" },
+          token,
+        }),
+      );
       if (!data.items?.length) return text("Історія замовлень порожня.");
       return text(
         data.items
@@ -1277,7 +1380,7 @@ server.tool(
   {},
   async () => {
     try {
-      const token = requireToken();
+      const token = await getToken();
       const balance = await silpoRequest<any>("/v1/loyalty-processing/my/balance", {
         base: EXTERNAL_BASE,
         token,
@@ -1308,14 +1411,15 @@ server.tool(
   { limit: z.number().int().min(1).max(50).default(20) },
   async ({ limit }) => {
     try {
-      const token = requireToken();
       const branch = requireBranch();
-      const data = await silpoRequest<ProductList>(
-        `/v1/uk/branches/${branch}/my/orders/latest-products`,
-        {
-          query: { limit, deliveryType: currentDeliveryType() },
-          token,
-        },
+      const data = await withAuthRetry((token) =>
+        silpoRequest<ProductList>(
+          `/v1/uk/branches/${branch}/my/orders/latest-products`,
+          {
+            query: { limit, deliveryType: currentDeliveryType() },
+            token,
+          },
+        ),
       );
       return text(formatProductList(data));
     } catch (e) {

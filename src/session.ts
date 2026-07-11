@@ -33,6 +33,8 @@ export interface Session {
   deliveryType?: DeliveryType;
   timeslot?: Timeslot;
   authToken?: string;
+  /** `.AspNetCore.Identity.Application` cookie for auto-refreshing authToken. */
+  authCookie?: string;
   basketId?: string;
   shoppingList: ShoppingListItem[];
 }
@@ -53,16 +55,6 @@ export function requireBranch(): string {
   return session.branchId;
 }
 
-export function requireToken(): string {
-  if (!session.authToken) {
-    throw new Error(
-      "This action needs authorization. Call set_auth_token with a Bearer token " +
-        "from your Silpo cabinet (id.silpo.ua) first.",
-    );
-  }
-  return session.authToken;
-}
-
 // ---------------------------------------------------------------------------
 // persistence (remote mode) — survive restarts/deploys/reboots
 // ---------------------------------------------------------------------------
@@ -74,6 +66,7 @@ const PERSIST_KEYS = [
   "deliveryType",
   "timeslot",
   "authToken",
+  "authCookie",
   "basketId",
   "shoppingList",
 ] as const;
