@@ -1,0 +1,9 @@
+node_modules
+dist
+docs
+*.har
+*.log
+.env
+.oauth-state.json
+.git
+*.md

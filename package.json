@@ -1,0 +1,44 @@
+{
+  "name": "silpo-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for the Silpo (Сільпо) online supermarket API — search products, browse categories, promotions, delivery zones/slots, carts and recipes via AI assistants.",
+  "type": "module",
+  "bin": {
+    "silpo-mcp": "dist/index.js",
+    "silpo-mcp-http": "dist/http.js"
+  },
+  "main": "dist/index.js",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "start:http": "node dist/http.js",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "silpo",
+    "grocery",
+    "ukraine",
+    "shopping",
+    "claude"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "express": "^5.0.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  }
+}

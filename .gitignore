@@ -1,0 +1,9 @@
+node_modules/
+dist/
+docs/
+*.har
+*.log
+.DS_Store
+.env
+.oauth-state.json
+deploy.local.md
