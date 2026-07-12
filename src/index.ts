@@ -237,7 +237,7 @@ async function geocode(
  */
 export function buildServer(): McpServer {
   const server = new McpServer(
-    { name: "silpo-mcp", version: "1.0.0" },
+    { name: "silpo-mcp", version: "2.0.0" },
     { capabilities: { tools: {} } },
   );
 
