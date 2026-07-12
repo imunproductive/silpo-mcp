@@ -148,31 +148,44 @@ function timeslotParams(): Record<string, string | undefined> {
   };
 }
 
+/** A timeslot whose start is already in the past is useless for stock checks. */
+function timeslotIsStale(): boolean {
+  if (!session.timeslot) return true;
+  const start = Date.parse(session.timeslot.start);
+  return !Number.isFinite(start) || start <= Date.now();
+}
+
 /**
- * Ensure a delivery timeslot is selected before a catalogue query.
+ * Ensure a *valid* delivery timeslot is selected before a catalogue query.
  *
  * For `LongDelivery` (and similar) branches the backend reports per-item
- * `stock` *relative to a delivery timeslot*: with no timeslot every product
- * comes back as `stock: 0`, which — combined with the default `inStock=true`
- * filter — makes an in-stock category look empty. The storefront always sends a
- * concrete slot, so we mirror that by auto-selecting the first available slot
- * for the current branch when none has been chosen yet. Best-effort: on any
- * failure we leave the timeslot unset and let the query proceed as before.
+ * `stock` *relative to a delivery timeslot*: with no timeslot — or a stale one
+ * whose start is already in the past — every product comes back as `stock: 0`,
+ * which — combined with the default `inStock=true` filter — makes an in-stock
+ * category look empty. The storefront always sends a concrete upcoming slot, so
+ * we mirror that by auto-selecting the nearest available slot for the current
+ * branch/delivery type whenever none is chosen or the chosen one has expired.
+ * Best-effort: on any failure we keep the current state and let the query
+ * proceed as before.
  */
 async function ensureTimeslot(): Promise<void> {
-  if (session.timeslot || !session.branchId) return;
+  if (!session.branchId || !timeslotIsStale()) return;
   try {
     const data = await silpoRequest<{
       items: Array<{ datePeriod: { start: string; end: string }; isAvailable: boolean }>;
     }>(`/v3/delivery/branches/${session.branchId}/time-slots`, {
       query: { deliveryTypes: [currentDeliveryType()] },
     });
-    const slot = data.items?.find((s) => s.isAvailable) ?? data.items?.[0];
+    const now = Date.now();
+    const upcoming = (data.items ?? [])
+      .filter((s) => s.isAvailable && Date.parse(s.datePeriod.start) > now)
+      .sort((a, b) => Date.parse(a.datePeriod.start) - Date.parse(b.datePeriod.start));
+    const slot = upcoming[0] ?? data.items?.find((s) => s.isAvailable) ?? data.items?.[0];
     if (slot) {
       session.timeslot = { start: slot.datePeriod.start, end: slot.datePeriod.end };
     }
   } catch {
-    /* no slots reachable — proceed without one */
+    /* no slots reachable — proceed with whatever we have */
   }
 }
 
@@ -934,7 +947,9 @@ server.tool(
   async () => {
     try {
       const branch = requireBranch();
+      await ensureTimeslot();
       const id = await ensureBasket();
+      await healCartTimeslot(id, await fetchServerCart(id));
       const added: string[] = [];
       const failed: string[] = [];
       for (const item of session.shoppingList) {
@@ -1143,6 +1158,25 @@ async function patchServerCart(id: string, overrides: Record<string, unknown> = 
   });
 }
 
+/**
+ * If the server cart carries a missing/expired timeslot, write the session's
+ * fresh slot back into it and re-GET. The PATCH body is rebuilt from session
+ * state (address/branch/delivery type), so only the session's own cart is
+ * healed — patching a foreign basketId would overwrite its settings with ours.
+ * Best-effort: on any failure the original cart is returned unchanged.
+ */
+async function healCartTimeslot(id: string, cart: any): Promise<any> {
+  const start = cart?.timeslot?.start ? Date.parse(cart.timeslot.start) : NaN;
+  const cartSlotExpired = !Number.isFinite(start) || start <= Date.now();
+  if (!cartSlotExpired || id !== session.basketId || timeslotIsStale()) return cart;
+  try {
+    await patchServerCart(id, { timeslot: session.timeslot });
+    return await fetchServerCart(id);
+  } catch {
+    return cart;
+  }
+}
+
 server.tool(
   "get_cart",
   "Переглянути кошик Сільпо (за basketId або збереженим у сесії).",
@@ -1151,7 +1185,9 @@ server.tool(
     try {
       const id = basketId ?? session.basketId;
       if (!id) return text("Кошик ще не створено — він з'явиться після першого add_to_cart.");
-      return text(summarizeServerCart(await fetchServerCart(id)));
+      await ensureTimeslot();
+      const cart = await healCartTimeslot(id, await fetchServerCart(id));
+      return text(summarizeServerCart(cart));
     } catch (e) {
       return fail(e);
     }
@@ -1187,7 +1223,9 @@ server.tool(
   async ({ productId, quantity }) => {
     try {
       const id = await ensureBasket();
-      const current = cartQuantityOf(await fetchServerCart(id), productId);
+      await ensureTimeslot();
+      const before = await healCartTimeslot(id, await fetchServerCart(id));
+      const current = cartQuantityOf(before, productId);
       const cart = await setServerCartQuantity(id, productId, current + quantity);
       return text(`✅ Додано в кошик.\n${summarizeServerCart(cart)}`);
     } catch (e) {
@@ -1206,6 +1244,8 @@ server.tool(
   async ({ productId, quantity }) => {
     try {
       const id = requireBasket();
+      await ensureTimeslot();
+      await healCartTimeslot(id, await fetchServerCart(id));
       const cart = await setServerCartQuantity(id, productId, quantity);
       return text(`✅ Кількість оновлено.\n${summarizeServerCart(cart)}`);
     } catch (e) {
@@ -1350,6 +1390,7 @@ server.tool(
   { limit: z.number().int().min(1).max(50).default(10) },
   async ({ limit }) => {
     try {
+      await ensureTimeslot();
       const data = await withAuthRetry((token) =>
         silpoRequest<any>("/v2/order-history/orders", {
           query: { limit, "filter[business]": "silpo" },
@@ -1394,6 +1435,7 @@ server.tool(
   },
   async ({ orderNumber, searchLimit }) => {
     try {
+      await ensureTimeslot();
       // The v3 store-front orders list already embeds each order's line items
       // under shipments[].items[], so no per-order fetch is needed.
       const data = await withAuthRetry((token) =>
@@ -1479,11 +1521,12 @@ server.tool(
   async ({ limit }) => {
     try {
       const branch = requireBranch();
+      await ensureTimeslot();
       const data = await withAuthRetry((token) =>
         silpoRequest<ProductList>(
           `/v1/uk/branches/${branch}/my/orders/latest-products`,
           {
-            query: { limit, deliveryType: currentDeliveryType() },
+            query: { limit, deliveryType: currentDeliveryType(), ...timeslotParams() },
             token,
           },
         ),
