@@ -248,7 +248,3 @@ silpo-mcp/
 ├── package.json
 └── tsconfig.json
 ```
-
-## Ліцензія
-
-MIT
