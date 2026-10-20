@@ -30,6 +30,7 @@ import {
   type ProductListItem,
 } from "./silpo-api.js";
 import {
+  enableSessionAutosave,
   requireBranch,
   session,
   type ShoppingListItem,
@@ -1546,6 +1547,10 @@ server.tool(
 // ===========================================================================
 
 async function main() {
+  // Opt-in: keep address, cart and cabinet token/cookie across client restarts.
+  if (process.env.SILPO_MCP_SESSION_FILE) {
+    enableSessionAutosave(process.env.SILPO_MCP_SESSION_FILE);
+  }
   const server = buildServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
